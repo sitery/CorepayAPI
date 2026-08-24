@@ -1,1 +1,302 @@
 # CorepayAPI
+openapi: 3.0.0
+info:
+  title: "CorePay - Terminal & ERP Integration API"
+  version: "1.0.0"
+  description: "This API describes the HTTP contract the client application calls to drive a payment or authorization transaction. It also outlines the core outbound driver requests handled by the upstream acquiring gateway."
+servers:
+  - url: "https://api.corepay.mock/v1"
+    description: "Production Base URL for Terminal API"
+  - url: "https://api.acquirer.mock/v1"
+    description: "UAT / Fallback URL for Upstream Banking Gateway"
+
+components:
+  securitySchemes:
+    TerminalId:
+      type: apiKey
+      in: header
+      name: X-Terminal-Id
+      description: "Stable, human-readable terminal identifier (MDM-pushed managed config)"
+    TerminalToken:
+      type: apiKey
+      in: header
+      name: X-Terminal-Token
+      description: "Per-terminal secret, rotatable (MDM-pushed managed config)"
+    TerminalSignature:
+      type: apiKey
+      in: header
+      name: X-Terminal-Signature
+      description: "HMAC SHA256 signature for payload validation"
+
+  schemas:
+    PaymentInitiationRequest:
+      type: object
+      required:
+        - transactionId
+        - kind
+        - identifier
+        - amountCents
+        - terminalID
+      properties:
+        transactionId:
+          type: string
+          format: uuid
+          description: "Terminal unique tracking ID tracker string, must match Idempotency-Key"
+        kind:
+          type: string
+          enum: [charge, preauth]
+          description: "Mapped transaction path definition"
+        identifier:
+          type: string
+          description: "Targeting identity marker (Customer Account Number or CRM account string)"
+        amountCents:
+          type: integer
+          description: "Grand total processing units in cents. Must be > 0. No floats."
+        terminalID:
+          type: string
+          description: "Hardware identification code representing the remote POS terminal"
+        email:
+          type: string
+          description: "Target customer address configuration string for delivery tracking"
+
+    PaymentInitiationResponse:
+      type: object
+      properties:
+        transactionId:
+          type: string
+          format: uuid
+          description: "Echoes the requested transactionId"
+        status:
+          type: string
+          example: "AWAITING_CARD"
+          description: "Initial status after waking up terminal"
+        createdAt:
+          type: string
+          format: date-time
+          description: "ISO 8601 UTC timestamp"
+        idempotentReplay:
+          type: boolean
+          description: "Returns true if this was a retry of an existing transaction"
+
+    PaymentStatusResponse:
+      type: object
+      properties:
+        transactionId:
+          type: string
+          format: uuid
+          description: "Terminal unique tracking ID"
+        status:
+          type: string
+          enum: [AWAITING_CARD, CARD_TAPPED, SUCCESS, FAILED, CANCELLED, TIMEOUT]
+          description: "Current state of the transaction"
+        updatedAt:
+          type: string
+          format: date-time
+          description: "ISO 8601 UTC timestamp"
+        receipt:
+          type: object
+          description: "Populated only on SUCCESS"
+          properties:
+            amountCents:
+              type: integer
+            kind:
+              type: string
+            target:
+              type: string
+            erpReference:
+              type: string
+              description: "ERP sales-order ID"
+            paymentMethod:
+              type: string
+            completedAt:
+              type: string
+              format: date-time
+        failure:
+          type: object
+          description: "Populated on FAILED, CANCELLED, or TIMEOUT"
+          properties:
+            reason:
+              type: string
+              enum: [CARD_DECLINED, INSUFFICIENT_FUNDS, CARD_EXPIRED, CUSTOMER_CANCELLED, NO_CARD_PRESENTED, PAYMENT_GATEWAY_ERROR, ERP_ERROR]
+              description: "Machine-readable failure reason"
+            message:
+              type: string
+              description: "Human-readable explanation"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: "Machine code for the error"
+        message:
+          type: string
+          description: "Human-readable explanation"
+        transactionId:
+          type: string
+          format: uuid
+        field:
+          type: string
+
+paths:
+  /api/payments/:
+    post:
+      tags:
+        - Inbound Terminal Edge API
+      summary: "Initiate a payment"
+      description: "Starts a payment or authorization session. The server tells the ERP/Payment Gateway to wake up the POS terminal and returns immediately."
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema:
+            type: string
+            format: uuid
+          required: true
+          description: "Every POST that creates or modifies state requires an Idempotency-Key header."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentInitiationRequest'
+      responses:
+        '200':
+          description: "Terminal lit up and prompting customer. Also returned for 409 Idempotency conflicts (returning existing txn)"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentInitiationResponse'
+        '400':
+          description: "INVALID_INPUT - Malformed account number or amount"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: "UNAUTHORIZED - Missing/invalid X-Terminal-* headers or signature mismatch"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/payments/{transactionId}/status:
+    get:
+      tags:
+        - Inbound Terminal Edge API
+      summary: "Poll for completion"
+      description: "Returns the current status of a payment session. Called on a polling interval by the terminal."
+      parameters:
+        - in: path
+          name: transactionId
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: "Current status of the transaction (always 200 regardless of payment outcome)"
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentStatusResponse'
+
+  /api/payment-cancel:
+    post:
+      tags:
+        - Inbound Terminal Edge API
+      summary: "Cancel Payment Session"
+      description: "Terminates an active session on the remote PIN pad terminal safely if a customer changes their mind or a software timeout exception occurs."
+      parameters:
+        - in: query
+          name: transactionId
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: "Passed inside standard URL query structures"
+      responses:
+        '200':
+          description: "Session successfully canceled"
+
+  /api/terminal-callback:
+    post:
+      tags:
+        - Inbound Terminal Edge API
+      summary: "Heartbeat Callback"
+      description: "Validates integration channel heartbeat status via a basic execution test loop."
+      security:
+        - TerminalSignature: []
+      responses:
+        '200':
+          description: "Callback success message"
+
+  /system-available:
+    post:
+      tags:
+        - Upstream Acquiring Gateway
+      summary: "Gateway Alive Request (gateway-alive-request)"
+      description: "Pings the backend provider gateway endpoint using a basic validation request body to verify connectivity."
+      responses:
+        '200':
+          description: "Returns status 0 if the connection is alive and verified."
+
+  /authorize-payment:
+    post:
+      tags:
+        - Upstream Acquiring Gateway
+      summary: "Gateway Authorize Request (gateway-authorise-request)"
+      description: "Submits account details to the provider platform to authorize a charge before capturing funds from the customer's card."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                merchantRequestReference:
+                  type: string
+                  description: "Combines the invoice, suffix, and line sequence numbers"
+                transactionValues:
+                  type: object
+                  description: "Transaction value payload block"
+                timezone:
+                  type: string
+                  example: "+13:00"
+                  description: "Local timezone code"
+                transactionType:
+                  type: string
+                  example: "Retail - Standard Charge"
+                  description: "Categorization for the acquiring bank"
+      responses:
+        '200':
+          description: "Successfully authorized, returns parsed XML/JSON output messages."
+
+  /apply-payment:
+    post:
+      tags:
+        - Upstream Acquiring Gateway
+      summary: "Gateway Apply Payment (gateway-apply)"
+      description: "Fires an outbound POST request passing the unique tracking key value explicitly to capture the funds and update the balance on the banking network."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                trackingKey:
+                  type: string
+                  description: "Unique tracking key value linking back to the authorization"
+      responses:
+        '200':
+          description: "Balance explicitly updated on the acquiring network."
+
+  /cancel-transaction:
+    post:
+      tags:
+        - Upstream Acquiring Gateway
+      summary: "Gateway Cancel Transaction (gateway-cancel)"
+      description: "Releases staged authorization flags inside the banking network by submitting an account cancellation statement via the remote endpoint."
+      responses:
+        '200':
+          description: "Staged flags released securely."
